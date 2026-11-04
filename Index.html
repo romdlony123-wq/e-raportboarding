@@ -1598,6 +1598,10 @@
 
     <!-- ================= LOGIKA JAVASCRIPT & BRIDGING KE CODE.GS ================= -->
     <script>
+        // ================= KONFIGURASI KONEKSI DATABASE & DEPLOYMENT =================
+        const IS_PREVIEW = false; // set default true untuk canvas
+        const GAS_URL = 'https://script.google.com/macros/s/AKfycbzuklLDO_DmYRsh6ZwvFyBs8snK4ZH0HF_dEwdGAHmB-1SvbDYmIUp3MEH6e7crmYiVDQ/exec';
+
         // Data Cadangan Default (Fallback & Inisialisasi Instan)
         const defaultSettings = {
             judul: 'LAPORAN CAPAIAN KOMPETENSI AKHIR SEMESTER',
@@ -1726,37 +1730,148 @@
         let arsipFolders = [];
         let currentAuthRole = null;
         let activeStudentId = 'santri_1';
-        let isConnectedToGoogle = typeof google !== 'undefined' && google.script && google.script.run;
 
-        // Bridge Caller ke Google Apps Script (Code.gs)
+        // Helper Pengecekan Lingkungan & Koneksi
+        function isGoogleScriptEnv() {
+            return typeof google !== 'undefined' && google.script && typeof google.script.run !== 'undefined';
+        }
+
+        function isValidGasUrl(url) {
+            return typeof url === 'string' && url.trim().startsWith('http') && !url.includes('URL_DEPLOY_GAS_ANDA_DISINI');
+        }
+
+        function isConnectedToDatabase() {
+            return isGoogleScriptEnv() || isValidGasUrl(GAS_URL);
+        }
+
+        let isConnectedToGoogle = isConnectedToDatabase();
+
+        // Bridge Caller ke Google Apps Script (Code.gs) & Web App Eksternal (Blogger, WordPress, Canvas, dll.)
         function callServer(functionName, args, onSuccess, onError) {
-            if (isConnectedToGoogle) {
+            // Jalur 1: Dijalankan langsung di Google Apps Script Web App (Native)
+            if (isGoogleScriptEnv()) {
                 showSyncIndicator(true);
                 let runner = google.script.run
                     .withSuccessHandler((response) => {
                         showSyncIndicator(false);
-                        if (response && response.success === false) {
-                            showToast('Info server: ' + (response.message || 'Gagal'));
-                            if (onError) onError(response);
-                        } else {
-                            if (onSuccess) onSuccess(response ? (response.data !== undefined ? response.data : response) : null);
-                        }
+                        handleServerSuccess(response, onSuccess, onError);
                     })
                     .withFailureHandler((err) => {
                         showSyncIndicator(false);
-                        showToast('Koneksi tertunda: ' + err.message);
+                        showToast('Koneksi tertunda: ' + (err.message || err));
                         if (onError) onError(err);
                     });
 
-                runner[functionName].apply(runner, args);
-            } else {
-                // Fallback saat dijalankan offline / browser lokal
-                showSyncIndicator(false);
-                if (onSuccess) onSuccess(null);
+                if (typeof runner[functionName] === 'function') {
+                    runner[functionName].apply(runner, args);
+                } else {
+                    console.error('Fungsi ' + functionName + ' tidak ditemukan di google.script.run');
+                    if (onError) onError(new Error('Fungsi ' + functionName + ' tidak ditemukan'));
+                }
+                return;
             }
+
+            // Jalur 2: Dijalankan dari Blogger / Web Eksternal dengan GAS_URL yang valid
+            if (isValidGasUrl(GAS_URL)) {
+                showSyncIndicator(true);
+
+                // Khusus pengambilan data awal, prioritaskan GET agar cepat & kompatibel dengan CORS redirect di browser
+                if (functionName === 'apiGetInitialData') {
+                    const getUrl = GAS_URL + (GAS_URL.includes('?') ? '&' : '?') + 'action=apiGetInitialData';
+                    fetch(getUrl, { method: 'GET', mode: 'cors' })
+                        .then(res => {
+                            if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + res.statusText);
+                            return res.json();
+                        })
+                        .then(response => {
+                            showSyncIndicator(false);
+                            handleServerSuccess(response, onSuccess, onError);
+                        })
+                        .catch(getErr => {
+                            console.warn('[GAS Bridge] GET apiGetInitialData gagal, mencoba via POST:', getErr);
+                            // Fallback ke POST jika GET terhambat
+                            fetch(GAS_URL, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                                body: JSON.stringify({ functionName, action: functionName, args: args || [] })
+                            })
+                                .then(res => res.json())
+                                .then(response => {
+                                    showSyncIndicator(false);
+                                    handleServerSuccess(response, onSuccess, onError);
+                                })
+                                .catch(postErr => {
+                                    showSyncIndicator(false);
+                                    console.error('[GAS Bridge] Koneksi gagal:', postErr);
+                                    showToast('Koneksi Web App: ' + (postErr.message || 'Gagal tersambung'));
+                                    if (onError) onError(postErr);
+                                });
+                        });
+                    return;
+                }
+
+                // Untuk operasi simpan/perubahan data, gunakan POST
+                fetch(GAS_URL, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'text/plain;charset=utf-8'
+                    },
+                    body: JSON.stringify({
+                        functionName: functionName,
+                        action: functionName,
+                        args: args || []
+                    })
+                })
+                    .then(res => {
+                        if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + res.statusText);
+                        return res.json();
+                    })
+                    .then(response => {
+                        showSyncIndicator(false);
+                        handleServerSuccess(response, onSuccess, onError);
+                    })
+                    .catch(err => {
+                        showSyncIndicator(false);
+                        console.warn(`[GAS Bridge] Gagal memanggil ${functionName}:`, err);
+                        showToast('Koneksi Web App: ' + (err.message || 'Gagal tersambung'));
+                        if (onError) onError(err);
+                    });
+                return;
+            }
+
+            // Jalur 3: Mode Preview / Canvas (IS_PREVIEW = true atau belum isi URL)
+            showSyncIndicator(false);
+            console.log(`[Preview Canvas] Mode simulasi lokal untuk: ${functionName}`, args);
+            // Kembalikan null agar aplikasi tetap berjalan dengan aman menggunakan data default/lokal
+            if (onSuccess) onSuccess(null);
+        }
+
+        function handleServerSuccess(response, onSuccess, onError) {
+            if (!response) {
+                if (onSuccess) onSuccess(null);
+                return;
+            }
+            if (response.success === false) {
+                showToast('Info server: ' + (response.message || 'Gagal'));
+                if (onError) onError(response);
+                return;
+            }
+            if (response.data && response.data.success === false) {
+                showToast('Info server: ' + (response.data.message || 'Gagal'));
+                if (onError) onError(response.data);
+                return;
+            }
+
+            // Buka seluruh layer pembungkus .data secara rekursif
+            let result = response;
+            while (result && typeof result === 'object' && result.data !== undefined && (result.success === true || result.success === undefined)) {
+                result = result.data;
+            }
+            if (onSuccess) onSuccess(result);
         }
 
         function showSyncIndicator(loading) {
+            const pill = document.getElementById('cloud-sync-pill');
             const text = document.getElementById('cloud-sync-text');
             const icon = document.getElementById('btn-sync-icon');
 
@@ -1764,20 +1879,42 @@
                 if (text) text.innerText = 'Menyimpan...';
                 if (icon) icon.classList.add('animate-spin');
             } else {
-                if (text) text.innerText = isConnectedToGoogle ? 'Sheets Terhubung' : 'Mode Offline';
                 if (icon) icon.classList.remove('animate-spin');
+                if (isGoogleScriptEnv()) {
+                    if (text) text.innerText = 'Sheets Terhubung';
+                    if (pill) pill.className = 'flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-2xs';
+                } else if (isValidGasUrl(GAS_URL)) {
+                    if (text) text.innerText = 'Cloud Terhubung';
+                    if (pill) pill.className = 'flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-2xs';
+                } else {
+                    if (text) text.innerText = 'Mode Preview (Canvas)';
+                    if (pill) pill.className = 'flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-semibold bg-amber-50 text-amber-700 border border-amber-200 shadow-2xs';
+                }
             }
         }
 
         // Inisialisasi Data dari Sheets
         function fetchDataFromServer(manualTrigger = false) {
+            if (!isGoogleScriptEnv() && !isValidGasUrl(GAS_URL)) {
+                showSyncIndicator(false);
+                if (manualTrigger) showToast('Mode Preview (Canvas): Menggunakan database lokal.');
+                return;
+            }
+
+            showSyncIndicator(true);
             callServer('apiGetInitialData', [], (data) => {
-                if (data) {
-                    if (data.settings && Object.keys(data.settings).length > 0) settings = data.settings;
-                    if (data.accounts && Object.keys(data.accounts).length > 0) accounts = data.accounts;
-                    if (data.subjects && data.subjects.length > 0) subjects = data.subjects;
-                    if (data.santriData && data.santriData.length > 0) santriData = data.santriData;
-                    if (data.arsipFolders) arsipFolders = data.arsipFolders;
+                // Ekstraksi data fleksibel jika masih ada pembungkus .data
+                let actual = data;
+                while (actual && typeof actual === 'object' && actual.data && !actual.santriData && !actual.settings) {
+                    actual = actual.data;
+                }
+
+                if (actual && (actual.santriData || actual.subjects || actual.settings)) {
+                    if (actual.settings && Object.keys(actual.settings).length > 0) settings = actual.settings;
+                    if (actual.accounts && Object.keys(actual.accounts).length > 0) accounts = actual.accounts;
+                    if (actual.subjects && actual.subjects.length > 0) subjects = actual.subjects;
+                    if (actual.santriData && actual.santriData.length > 0) santriData = actual.santriData;
+                    if (actual.arsipFolders) arsipFolders = actual.arsipFolders;
 
                     if (santriData.length > 0 && (!activeStudentId || !santriData.find(s => s.id === activeStudentId))) {
                         activeStudentId = santriData[0].id;
@@ -1802,8 +1939,15 @@
                         if (curUser) applyRolePermissions(curUser);
                     }
 
-                    if (manualTrigger) showToast('Database tersinkronisasi dari Google Sheets!');
+                    showSyncIndicator(false);
+                    showToast(`Database terhubung! ${santriData.length} data santri berhasil ditarik.`);
+                } else {
+                    showSyncIndicator(false);
+                    console.warn('[Database Sync] Struktur data belum sesuai:', actual);
                 }
+            }, (err) => {
+                showSyncIndicator(false);
+                showToast('Koneksi database tertunda: ' + (err.message || 'Cek konsol browser'));
             });
         }
 
@@ -3417,9 +3561,13 @@
                 document.querySelectorAll('textarea.auto-resize-desc, #input-catatan-wali').forEach(autoResizeTextarea);
             });
 
-            // Sinkronkan data aktual dari Google Sheets (Code.gs)
+            // Perbarui indikator status koneksi (Preview / Cloud / Sheets)
+            showSyncIndicator(false);
+
+            // Sinkronkan data aktual dari Google Sheets (Code.gs / Web App)
             fetchDataFromServer();
         });
     </script>
 </body>
+
 </html>
